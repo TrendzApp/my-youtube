@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Video or playlist URL"
+        description: "Video URL"
         required: true
 
       format:
@@ -12,54 +12,60 @@ on:
         required: true
         default: video
 
-      quality:
-        description: "video quality"
-        required: false
-        default: best
-
 jobs:
   download:
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install ffmpeg zip -y
-          pip install yt-dlp
+          sudo apt install ffmpeg zip nodejs npm -y
+          pip install -U yt-dlp
 
-      - name: Download media
+      - name: Create cookies file
+        run: |
+          echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+
+      - name: Download
         run: |
           mkdir -p videos
 
           if [ "${{ github.event.inputs.format }}" = "mp3" ]; then
-            yt-dlp "${{ github.event.inputs.url }}" \
-            --extract-audio \
-            --audio-format mp3 \
-            -o "videos/%(title)s.%(ext)s"
+            yt-dlp \
+              --cookies cookies.txt \
+              --extract-audio \
+              --audio-format mp3 \
+              -o "videos/%(title)s.%(ext)s" \
+              "${{ github.event.inputs.url }}"
           else
-            yt-dlp "${{ github.event.inputs.url }}" \
-            -f "${{ github.event.inputs.quality }}" \
-            -o "videos/%(title)s.%(ext)s"
+            yt-dlp \
+              --cookies cookies.txt \
+              -o "videos/%(title)s.%(ext)s" \
+              "${{ github.event.inputs.url }}"
           fi
 
-      - name: Split large files
+      - name: Split files
         run: |
           cd videos
+
           for f in *; do
-            zip -s 95m "$f.zip" "$f"
-            rm "$f"
+            size=$(stat -c%s "$f")
+
+            if [ $size -gt 95000000 ]; then
+              zip -s 95m "$f.zip" "$f"
+              rm "$f"
+            fi
           done
 
-      - name: Upload release
+      - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: videos-${{ github.run_number }}
-          name: videos-${{ github.run_number }}
           files: videos/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
