@@ -1,8 +1,9 @@
-name: Video Downloader
+name: Pro Video Downloader
 
 on:
   workflow_dispatch:
     inputs:
+
       urls:
         description: "Video URLs (one per line)"
         required: true
@@ -17,6 +18,7 @@ permissions:
 
 jobs:
   download:
+
     runs-on: ubuntu-latest
 
     steps:
@@ -28,13 +30,24 @@ jobs:
         run: |
 
           sudo apt update
-          sudo apt install -y ffmpeg aria2 zip parallel
 
+          sudo apt install -y \
+            ffmpeg \
+            aria2 \
+            parallel \
+            zip \
+            unzip \
+            jq \
+            curl
+
+          python3 -m pip install -U pip
           python3 -m pip install -U yt-dlp
 
       - name: Prepare folders
         run: |
+
           mkdir -p videos
+          mkdir -p temp
 
       - name: Save URLs
         run: |
@@ -56,32 +69,36 @@ jobs:
 
             DIR="$1"
 
-            find "$DIR" -type f | while read f; do
+            find "$DIR" -type f | while read FILE; do
 
-              SIZE=$(stat -c%s "$f")
+              SIZE=$(stat -c%s "$FILE")
 
               if [ "$SIZE" -gt 95000000 ]; then
 
-                cd "$(dirname "$f")"
+                cd "$(dirname "$FILE")"
 
-                zip -s 95m -0 "$(basename "$f").zip" "$(basename "$f")"
+                BASE=$(basename "$FILE")
 
-                rm -f "$(basename "$f")"
+                zip -s 95m -0 "${BASE}.zip" "$BASE"
+
+                rm -f "$BASE"
 
                 cd - >/dev/null
 
               fi
 
             done
+
           }
 
           download_one() {
 
             URL="$1"
 
-            echo "Processing $URL"
+            echo "Processing:"
+            echo "$URL"
 
-            TITLE=$(yt-dlp --get-title "$URL" | head -n1)
+            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1)
 
             if [ -z "$TITLE" ]; then
               TITLE="video_$(date +%s)"
@@ -95,24 +112,32 @@ jobs:
 
             yt-dlp \
               --no-playlist \
-              --retries 30 \
-              --fragment-retries 30 \
+              --retries 50 \
+              --fragment-retries 50 \
               --retry-sleep 5 \
-              --concurrent-fragments 5 \
+              --socket-timeout 30 \
+              --extractor-retries 20 \
+              --file-access-retries 20 \
+              --concurrent-fragments 8 \
               --downloader aria2c \
               --downloader-args "aria2c:-x 16 -k 1M" \
               --merge-output-format mp4 \
+              --user-agent "Mozilla/5.0" \
               -o "$DIR/%(title)s.%(ext)s" \
               "$URL"
 
             COUNT=$(find "$DIR" -type f | wc -l)
 
             if [ "$COUNT" -eq 0 ]; then
-              echo "Download failed for $URL"
+              echo "Download failed:"
+              echo "$URL"
               exit 1
             fi
 
             split_large "$DIR"
+
+            echo "Done:"
+            echo "$URL"
 
           }
 
@@ -126,7 +151,11 @@ jobs:
         run: |
           find videos -type d -empty -delete
 
-      - name: Commit
+      - name: Show files
+        run: |
+          find videos -type f
+
+      - name: Commit files
         run: |
 
           git config --global user.name "github-actions"
