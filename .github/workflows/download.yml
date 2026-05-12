@@ -1,4 +1,4 @@
-name: Ultra Smart Downloader
+name: Video Downloader
 
 on:
   workflow_dispatch:
@@ -7,90 +7,133 @@ on:
         description: "Video URLs (one per line)"
         required: true
 
+      threads:
+        description: "Concurrent downloads"
+        required: true
+        default: "6"
+
 permissions:
   contents: write
 
 jobs:
-  downloader:
+  download:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          submodules: false
-          lfs: false
 
       - name: Install tools
         run: |
+
           sudo apt update
-          sudo apt install -y ffmpeg aria2 jq curl zip
+          sudo apt install -y ffmpeg aria2 zip parallel
+
           python3 -m pip install -U yt-dlp
 
       - name: Prepare folders
         run: |
           mkdir -p videos
-          mkdir -p reports
 
-          echo "${{ github.event.inputs.urls }}" > urls.txt
-          sed -i '/^\s*$/d' urls.txt
-
-      - name: Run Smart Downloader
+      - name: Save URLs
         run: |
-          set -Eeuo pipefail
 
-          download_video () {
+          cat > urls.txt << 'EOF'
+          ${{ github.event.inputs.urls }}
+          EOF
+
+      - name: Download videos
+        env:
+          THREADS: ${{ github.event.inputs.threads }}
+        run: |
+
+          sanitize() {
+            echo "$1" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-120
+          }
+
+          split_large() {
+
+            DIR="$1"
+
+            find "$DIR" -type f | while read f; do
+
+              SIZE=$(stat -c%s "$f")
+
+              if [ "$SIZE" -gt 95000000 ]; then
+
+                cd "$(dirname "$f")"
+
+                zip -s 95m -0 "$(basename "$f").zip" "$(basename "$f")"
+
+                rm -f "$(basename "$f")"
+
+                cd - >/dev/null
+
+              fi
+
+            done
+          }
+
+          download_one() {
 
             URL="$1"
 
-            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || echo "video_$(date +%s)")
-            SAFE=$(echo "$TITLE" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-100)
+            echo "Processing $URL"
+
+            TITLE=$(yt-dlp --get-title "$URL" | head -n1)
+
+            if [ -z "$TITLE" ]; then
+              TITLE="video_$(date +%s)"
+            fi
+
+            SAFE=$(sanitize "$TITLE")
 
             DIR="videos/$SAFE"
+
             mkdir -p "$DIR"
 
-            echo "Downloading $URL"
-
             yt-dlp \
-              --continue \
+              --no-playlist \
               --retries 30 \
               --fragment-retries 30 \
-              --socket-timeout 30 \
+              --retry-sleep 5 \
+              --concurrent-fragments 5 \
               --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              --embed-metadata \
-              --embed-thumbnail \
-              --write-info-json \
-              --write-description \
-              --no-overwrites \
+              --downloader-args "aria2c:-x 16 -k 1M" \
+              --merge-output-format mp4 \
               -o "$DIR/%(title)s.%(ext)s" \
-              "$URL" > "$DIR/log.txt" 2>&1 || {
-                echo "$URL" >> reports/errors.txt
-                return
-              }
+              "$URL"
 
-            # split large files
-            find "$DIR" -type f -size +95M -exec zip -s 95m -0 "{}.zip" "{}" \; -exec rm "{}" \;
+            COUNT=$(find "$DIR" -type f | wc -l)
+
+            if [ "$COUNT" -eq 0 ]; then
+              echo "Download failed for $URL"
+              exit 1
+            fi
+
+            split_large "$DIR"
+
           }
 
-          while IFS= read -r url; do
-            [ -z "$url" ] && continue
-            download_video "$url"
-          done < urls.txt
+          export -f sanitize
+          export -f split_large
+          export -f download_one
 
-      - name: Commit results
+          cat urls.txt | sed '/^\s*$/d' | parallel -j "$THREADS" download_one {}
+
+      - name: Remove empty folders
         run: |
+          find videos -type d -empty -delete
+
+      - name: Commit
+        run: |
+
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
-          git add videos reports
+          git add videos/
 
-          if git diff --cached --quiet; then
-            echo "Nothing new to commit"
-            exit 0
-          fi
+          git commit -m "Add downloaded videos" || echo "Nothing new"
 
-          git commit -m "auto download finished"
-
-          git push --force-with-lease origin main
+          git push
