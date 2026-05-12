@@ -11,12 +11,12 @@ on:
       mode:
         description: "video or audio"
         required: true
-        default: video
+        default: "video"
 
       quality:
         description: "best / 1080 / 720 / 480 / 360"
         required: true
-        default: best
+        default: "best"
 
 jobs:
   download:
@@ -24,19 +24,21 @@ jobs:
 
     steps:
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install packages
+      - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y ffmpeg zip
           pip install -U yt-dlp
 
-           - name: Download
+      - name: Create videos folder
         run: |
-
           mkdir -p videos
+
+      - name: Download media
+        run: |
 
           QUALITY="${{ github.event.inputs.quality }}"
 
@@ -52,6 +54,9 @@ jobs:
             FORMAT="bv*+ba/b"
           fi
 
+          echo "Selected quality: $QUALITY"
+          echo "Using format: $FORMAT"
+
           if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
 
             yt-dlp \
@@ -60,6 +65,7 @@ jobs:
               --audio-quality 0 \
               --restrict-filenames \
               --windows-filenames \
+              --no-playlist \
               --retries 10 \
               --fragment-retries 10 \
               --concurrent-fragments 4 \
@@ -74,6 +80,7 @@ jobs:
               --merge-output-format mp4 \
               --restrict-filenames \
               --windows-filenames \
+              --no-playlist \
               --retries 10 \
               --fragment-retries 10 \
               --concurrent-fragments 4 \
@@ -83,6 +90,10 @@ jobs:
 
           fi
 
+      - name: Show downloaded files
+        run: |
+          echo "Downloaded files:"
+          ls -lh videos
 
       - name: Split large files
         run: |
@@ -95,11 +106,19 @@ jobs:
 
               size=$(stat -c%s "$f")
 
+              echo "Checking $f"
+
               if [ $size -gt 95000000 ]; then
+
+                echo "Splitting $f"
 
                 zip -s 95m "$f.zip" "$f"
 
                 rm "$f"
+
+              else
+
+                echo "$f is under 95MB"
 
               fi
 
@@ -107,16 +126,17 @@ jobs:
 
           done
 
-      - name: Upload artifacts
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: downloaded-files
           path: videos/*
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: release-${{ github.run_number }}
+          name: release-${{ github.run_number }}
           files: videos/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
