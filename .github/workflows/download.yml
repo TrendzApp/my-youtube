@@ -43,6 +43,7 @@ jobs:
       - name: Download media
         run: |
 
+          URL="${{ github.event.inputs.url }}"
           QUALITY="${{ github.event.inputs.quality }}"
 
           if [ "$QUALITY" = "1080" ]; then
@@ -57,6 +58,10 @@ jobs:
             FORMAT="bv*+ba/b"
           fi
 
+          TITLE=$(yt-dlp --get-title --restrict-filenames "$URL")
+
+          mkdir -p "videos/$TITLE"
+
           if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
 
             yt-dlp \
@@ -66,8 +71,8 @@ jobs:
               --restrict-filenames \
               --windows-filenames \
               --no-playlist \
-              -o "videos/%(title)s.%(ext)s" \
-              "${{ github.event.inputs.url }}"
+              -o "videos/$TITLE/%(title)s.%(ext)s" \
+              "$URL"
 
           else
 
@@ -77,28 +82,25 @@ jobs:
               --restrict-filenames \
               --windows-filenames \
               --no-playlist \
-              -o "videos/%(title)s.%(ext)s" \
-              "${{ github.event.inputs.url }}"
+              -o "videos/$TITLE/%(title)s.%(ext)s" \
+              "$URL"
 
           fi
 
       - name: Split large files
         run: |
 
-          cd videos
+          find videos -type f | while read f; do
 
-          for f in *; do
+            size=$(stat -c%s "$f")
 
-            if [ -f "$f" ]; then
+            if [ $size -gt 95000000 ]; then
 
-              size=$(stat -c%s "$f")
+              echo "Splitting $f"
 
-              if [ $size -gt 95000000 ]; then
+              zip -s 95m "${f}.zip" "$f"
 
-                zip -s 95m "${f}.zip" "$f"
-                rm "$f"
-
-              fi
+              rm "$f"
 
             fi
 
@@ -109,6 +111,8 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
-          git add videos/*
-          git commit -m "Add downloaded video"
+          git add videos/
+
+          git commit -m "Add downloaded media" || echo "Nothing to commit"
+
           git push
