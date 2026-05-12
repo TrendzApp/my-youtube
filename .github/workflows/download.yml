@@ -1,0 +1,65 @@
+name: Video Downloader Pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Video or playlist URL"
+        required: true
+
+      format:
+        description: "video or mp3"
+        required: true
+        default: video
+
+      quality:
+        description: "video quality"
+        required: false
+        default: best
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install ffmpeg zip -y
+          pip install yt-dlp
+
+      - name: Download media
+        run: |
+          mkdir -p videos
+
+          if [ "${{ github.event.inputs.format }}" = "mp3" ]; then
+            yt-dlp "${{ github.event.inputs.url }}" \
+            --extract-audio \
+            --audio-format mp3 \
+            -o "videos/%(title)s.%(ext)s"
+          else
+            yt-dlp "${{ github.event.inputs.url }}" \
+            -f "${{ github.event.inputs.quality }}" \
+            -o "videos/%(title)s.%(ext)s"
+          fi
+
+      - name: Split large files
+        run: |
+          cd videos
+          for f in *; do
+            zip -s 95m "$f.zip" "$f"
+            rm "$f"
+          done
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: videos-${{ github.run_number }}
+          name: videos-${{ github.run_number }}
+          files: videos/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
