@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "URLs (one per line)"
+        description: "Video URLs (one per line)"
         required: true
 
 permissions:
@@ -13,60 +13,84 @@ permissions:
 jobs:
   downloader:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          submodules: false
+          lfs: false
 
       - name: Install tools
         run: |
-          sudo apt update && sudo apt install -y ffmpeg aria2 jq curl zip
+          sudo apt update
+          sudo apt install -y ffmpeg aria2 jq curl zip
           python3 -m pip install -U yt-dlp
 
-      - name: Prepare
+      - name: Prepare folders
         run: |
-          mkdir -p videos reports
+          mkdir -p videos
+          mkdir -p reports
+
           echo "${{ github.event.inputs.urls }}" > urls.txt
           sed -i '/^\s*$/d' urls.txt
 
-      - name: Run Downloader
+      - name: Run Smart Downloader
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          # تابع دانلود تک ویدیو
-          download_single() {
-            local URL="$1"
-            local TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || echo "video_$(date +%s)")
-            local SAFE=$(echo "$TITLE" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-100)
-            local DIR="videos/$SAFE"
+          download_video () {
+
+            URL="$1"
+
+            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || echo "video_$(date +%s)")
+            SAFE=$(echo "$TITLE" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-100)
+
+            DIR="videos/$SAFE"
             mkdir -p "$DIR"
 
-            echo "Downloading: $URL"
+            echo "Downloading $URL"
+
             yt-dlp \
-              --continue --retries 30 --fragment-retries 30 \
-              --downloader aria2c --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              --embed-metadata --write-info-json \
-              -o "$DIR/%(title)s.%(ext)s" "$URL" > "$DIR/log.txt" 2>&1 || return 1
-            
-            # تقسیم فایل‌های بزرگ
+              --continue \
+              --retries 30 \
+              --fragment-retries 30 \
+              --socket-timeout 30 \
+              --downloader aria2c \
+              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+              --embed-metadata \
+              --embed-thumbnail \
+              --write-info-json \
+              --write-description \
+              --no-overwrites \
+              -o "$DIR/%(title)s.%(ext)s" \
+              "$URL" > "$DIR/log.txt" 2>&1 || {
+                echo "$URL" >> reports/errors.txt
+                return
+              }
+
+            # split large files
             find "$DIR" -type f -size +95M -exec zip -s 95m -0 "{}.zip" "{}" \; -exec rm "{}" \;
           }
 
-          # حلقه اصلی (جایگزین parallel برای جلوگیری از ارور)
           while IFS= read -r url; do
             [ -z "$url" ] && continue
-            download_single "$url" || echo "Failed to download $url" >> reports/errors.txt
+            download_video "$url"
           done < urls.txt
 
-      - name: Commit and Push
+      - name: Commit results
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
+
           git add videos reports
-          if ! git diff --cached --quiet; then
-            git commit -m "auto download finished"
-            git push
-          else
-            echo "Nothing new to commit."
+
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit"
+            exit 0
           fi
+
+          git commit -m "auto download finished"
+
+          git push --force-with-lease origin main
