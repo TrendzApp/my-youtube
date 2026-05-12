@@ -57,9 +57,6 @@ jobs:
             FORMAT="bv*+ba/b"
           fi
 
-          echo "Selected quality: $QUALITY"
-          echo "Using format: $FORMAT"
-
           if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
 
             yt-dlp \
@@ -69,10 +66,6 @@ jobs:
               --restrict-filenames \
               --windows-filenames \
               --no-playlist \
-              --retries 10 \
-              --fragment-retries 10 \
-              --concurrent-fragments 4 \
-              --user-agent "Mozilla/5.0" \
               -o "videos/%(title)s.%(ext)s" \
               "${{ github.event.inputs.url }}"
 
@@ -84,19 +77,10 @@ jobs:
               --restrict-filenames \
               --windows-filenames \
               --no-playlist \
-              --retries 10 \
-              --fragment-retries 10 \
-              --concurrent-fragments 4 \
-              --user-agent "Mozilla/5.0" \
               -o "videos/%(title)s.%(ext)s" \
               "${{ github.event.inputs.url }}"
 
           fi
-
-      - name: Show downloaded files
-        run: |
-          echo "Downloaded files:"
-          ls -lh videos
 
       - name: Split large files
         run: |
@@ -109,19 +93,10 @@ jobs:
 
               size=$(stat -c%s "$f")
 
-              echo "Checking $f"
-
               if [ $size -gt 95000000 ]; then
 
-                echo "Splitting $f into multi-part zip"
-
                 zip -s 95m "${f}.zip" "$f"
-
                 rm "$f"
-
-              else
-
-                echo "$f is under 95MB"
 
               fi
 
@@ -129,18 +104,11 @@ jobs:
 
           done
 
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: downloaded-files
-          path: videos/*
+      - name: Commit files to repo
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        continue-on-error: true
-        with:
-          tag_name: release-${{ github.run_number }}
-          name: release-${{ github.run_number }}
-          files: videos/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git add videos/*
+          git commit -m "Add downloaded video"
+          git push
