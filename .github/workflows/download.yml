@@ -33,7 +33,7 @@ jobs:
           sudo apt install -y ffmpeg zip
           pip install -U yt-dlp
 
-      - name: Download
+           - name: Download
         run: |
 
           mkdir -p videos
@@ -58,9 +58,8 @@ jobs:
               --extract-audio \
               --audio-format mp3 \
               --audio-quality 0 \
-              --embed-metadata \
-              --embed-thumbnail \
-              --add-metadata \
+              --restrict-filenames \
+              --windows-filenames \
               --retries 10 \
               --fragment-retries 10 \
               --concurrent-fragments 4 \
@@ -73,9 +72,8 @@ jobs:
             yt-dlp \
               -f "$FORMAT" \
               --merge-output-format mp4 \
-              --embed-metadata \
-              --embed-thumbnail \
-              --add-metadata \
+              --restrict-filenames \
+              --windows-filenames \
               --retries 10 \
               --fragment-retries 10 \
               --concurrent-fragments 4 \
@@ -84,6 +82,7 @@ jobs:
               "${{ github.event.inputs.url }}"
 
           fi
+
 
       - name: Split large files
         run: |
