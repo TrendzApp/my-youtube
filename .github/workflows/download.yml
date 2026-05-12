@@ -1,4 +1,4 @@
-name: Super Smart Downloader
+name: Ultra Smart Downloader
 
 on:
   workflow_dispatch:
@@ -6,10 +6,11 @@ on:
       urls:
         description: "URLs (one per line)"
         required: true
+
       parallel:
-        description: "Parallel URL workers"
-        default: "4"
+        description: "Parallel jobs"
         required: true
+        default: "4"
 
 permissions:
   contents: write
@@ -20,19 +21,32 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: checkout
+
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: install tools
+      - name: Install tools
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg aria2 parallel jq curl grep sed zip
+
+          sudo apt install -y \
+            ffmpeg \
+            aria2 \
+            parallel \
+            jq \
+            curl \
+            grep \
+            sed \
+            zip
+
           python3 -m pip install -U yt-dlp
 
-      - name: prepare
+      - name: Prepare
         run: |
+
           mkdir -p videos
-          mkdir -p logs
+          mkdir -p reports
+          mkdir -p temp
 
           cat <<EOF > urls.txt
           ${{ github.event.inputs.urls }}
@@ -40,18 +54,35 @@ jobs:
 
           sed -i '/^\s*$/d' urls.txt
 
-      - name: smart engine
+      - name: Smart Engine
         env:
           PARALLEL: ${{ github.event.inputs.parallel }}
         run: |
 
+          set -Eeuo pipefail
+
           sanitize() {
-            echo "$1" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-120
+            echo "$1" \
+            | sed 's#[\\/:"*?<>|]#_#g' \
+            | tr '\n' ' ' \
+            | cut -c1-120
+          }
+
+          media_count() {
+
+            find "$1" -type f \( \
+              -iname "*.mp4" -o \
+              -iname "*.mkv" -o \
+              -iname "*.webm" -o \
+              -iname "*.mp3" -o \
+              -iname "*.m4a" -o \
+              -iname "*.mov" \
+            \) | wc -l
           }
 
           split_large() {
 
-            find "$1" -type f | while read f; do
+            find "$1" -type f | while read -r f; do
 
               size=$(stat -c%s "$f")
 
@@ -59,6 +90,8 @@ jobs:
 
                 dir=$(dirname "$f")
                 base=$(basename "$f")
+
+                echo "Splitting large file: $base"
 
                 cd "$dir"
 
@@ -72,39 +105,85 @@ jobs:
             done
           }
 
-          media_count() {
-
-            find "$1" -type f \( \
-            -iname "*.mp4" -o \
-            -iname "*.mkv" -o \
-            -iname "*.webm" -o \
-            -iname "*.mp3" -o \
-            -iname "*.m4a" \
-            \) | wc -l
-          }
-
           crawl_page() {
 
             URL="$1"
 
-            TMP="page.html"
+            TMP="temp/page_$(date +%s%N).html"
 
-            curl -L -s "$URL" -o "$TMP"
+            curl \
+              -L \
+              --silent \
+              --fail \
+              "$URL" \
+              -o "$TMP" || true
 
-            grep -Eo '(https?://[^"]+\.(mp4|m3u8|webm|mpd))' "$TMP" | sort -u
+            grep -Eo '(https?://[^"'"'"' ]+\.(mp4|m3u8|webm|mpd))' "$TMP" 2>/dev/null || true
 
             grep -Eo 'src="https?://[^"]+"' "$TMP" \
             | cut -d'"' -f2 \
-            | grep -E '(mp4|m3u8|webm|mpd)' \
-            | sort -u
+            | grep -E '(mp4|m3u8|webm|mpd)' || true
 
+            grep -Eo 'https://[^ ]+' "$TMP" \
+            | grep -E '(video|stream|m3u8|mp4)' || true
+
+            rm -f "$TMP"
+
+          }
+
+          detect_type() {
+
+            URL="$1"
+
+            if yt-dlp --flat-playlist --dump-json "$URL" > temp/check.json 2>/dev/null; then
+
+              COUNT=$(cat temp/check.json | wc -l)
+
+              if [ "$COUNT" -gt 1 ]; then
+                echo "playlist"
+                return
+              fi
+
+            fi
+
+            echo "single"
+
+          }
+
+          already_downloaded() {
+
+            URL="$1"
+
+            if grep -R "$URL" reports 2>/dev/null; then
+              return 0
+            fi
+
+            return 1
+          }
+
+          save_report() {
+
+            URL="$1"
+            STATUS="$2"
+            DIR="$3"
+
+            FILE="reports/report_$(date +%s%N).json"
+
+            cat <<EOF > "$FILE"
+          {
+            "url": "$URL",
+            "status": "$STATUS",
+            "directory": "$DIR",
+            "timestamp": "$(date)"
+          }
+          EOF
           }
 
           download_single() {
 
             URL="$1"
 
-            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1)
+            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || true)
 
             [ -z "$TITLE" ] && TITLE="video_$(date +%s)"
 
@@ -118,30 +197,51 @@ jobs:
 
             yt-dlp \
               --continue \
-              --retries 40 \
-              --fragment-retries 40 \
+              --no-overwrites \
+              --retries 50 \
+              --fragment-retries 50 \
+              --retry-sleep 5 \
               --concurrent-fragments 8 \
+              --extractor-retries 20 \
+              --file-access-retries 20 \
               --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -k 1M" \
+              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
               --merge-output-format mp4 \
+              --embed-metadata \
+              --embed-thumbnail \
+              --write-info-json \
+              --write-description \
               -o "$DIR/%(title)s.%(ext)s" \
               "$URL" \
-              > "$DIR/log.txt" 2>&1 || true
+              > "$DIR/download.log" 2>&1 || true
 
             AFTER=$(media_count "$DIR")
 
             if [ "$AFTER" -le "$BEFORE" ]; then
+
+              echo "No media downloaded from $URL"
+
+              save_report "$URL" "failed" "$DIR"
+
               return 1
             fi
 
             split_large "$DIR"
+
+            save_report "$URL" "success" "$DIR"
+
+            return 0
           }
 
           download_playlist() {
 
             URL="$1"
 
-            NAME=$(yt-dlp --flat-playlist --print "%(playlist_title)s" "$URL" | head -n1)
+            NAME=$(yt-dlp \
+              --flat-playlist \
+              --print "%(playlist_title)s" \
+              "$URL" 2>/dev/null \
+              | head -n1 || true)
 
             [ -z "$NAME" ] && NAME="playlist_$(date +%s)"
 
@@ -154,61 +254,71 @@ jobs:
             yt-dlp \
               --yes-playlist \
               --continue \
-              --retries 40 \
-              --fragment-retries 40 \
+              --no-overwrites \
+              --retries 50 \
+              --fragment-retries 50 \
               --concurrent-fragments 8 \
               --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -k 1M" \
+              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+              --embed-metadata \
+              --write-info-json \
               -o "$DIR/%(playlist_index)s-%(title)s.%(ext)s" \
               "$URL" \
-              > "$DIR/log.txt" 2>&1 || true
+              > "$DIR/download.log" 2>&1 || true
+
+            COUNT=$(media_count "$DIR")
+
+            if [ "$COUNT" -eq 0 ]; then
+
+              echo "Playlist failed"
+
+              save_report "$URL" "failed" "$DIR"
+
+              return 1
+            fi
 
             split_large "$DIR"
-          }
 
-          detect_type() {
+            save_report "$URL" "success" "$DIR"
 
-            URL="$1"
-
-            COUNT=$(yt-dlp --flat-playlist --dump-json "$URL" 2>/dev/null | wc -l)
-
-            if [ "$COUNT" -gt 1 ]; then
-              echo playlist
-            else
-              echo single
-            fi
+            return 0
           }
 
           process_url() {
 
             URL="$1"
 
-            echo "Processing $URL"
+            echo ""
+            echo "====================================="
+            echo "Processing: $URL"
+            echo "====================================="
 
-            TYPE=$(detect_type "$URL")
-
-            if [ "$TYPE" = "playlist" ]; then
-
-              echo "Playlist detected"
-
-              download_playlist "$URL"
-
+            if already_downloaded "$URL"; then
+              echo "Already downloaded before"
               return
             fi
 
-            echo "Trying single video"
+            TYPE=$(detect_type "$URL")
+
+            echo "Detected type: $TYPE"
+
+            if [ "$TYPE" = "playlist" ]; then
+
+              download_playlist "$URL" && return
+
+            fi
 
             if download_single "$URL"; then
               return
             fi
 
-            echo "Trying crawl mode"
+            echo "Trying crawl mode..."
 
-            LINKS=$(crawl_page "$URL")
+            LINKS=$(crawl_page "$URL" | sort -u)
 
             for L in $LINKS; do
 
-              echo "Found media $L"
+              echo "Found media: $L"
 
               download_single "$L" || true
 
@@ -217,35 +327,45 @@ jobs:
           }
 
           export -f sanitize
-          export -f split_large
           export -f media_count
+          export -f split_large
           export -f crawl_page
+          export -f detect_type
+          export -f already_downloaded
+          export -f save_report
           export -f download_single
           export -f download_playlist
-          export -f detect_type
           export -f process_url
 
-          cat urls.txt | parallel -j $PARALLEL process_url {}
+          parallel \
+            -j "$PARALLEL" \
+            process_url \
+            :::: urls.txt
 
-      - name: cleanup
+      - name: Cleanup empty folders
         run: |
           find videos -type d -empty -delete
 
-      - name: show files
+      - name: Show downloaded files
         run: |
-          find videos -type f
+          echo "Downloaded files:"
+          find videos -type f || true
 
-      - name: commit
+      - name: Commit and Push
         run: |
 
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
-          git add videos
+          git add videos reports
 
           if git diff --cached --quiet; then
-            echo "nothing to commit"
+
+            echo "Nothing to commit"
+
           else
+
             git commit -m "auto downloaded media"
             git push
+
           fi
