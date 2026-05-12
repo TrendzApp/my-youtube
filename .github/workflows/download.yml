@@ -1,19 +1,25 @@
-name: Video Downloader
+name: Universal Downloader
+
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
     inputs:
-      urls:
-        description: "Video URLs (one per line)"
+
+      url:
+        description: "Video URL"
         required: true
 
-      threads:
-        description: "Concurrent downloads"
+      mode:
+        description: "video or audio"
         required: true
-        default: "6"
+        default: "video"
 
-permissions:
-  contents: write
+      quality:
+        description: "best / 1080 / 720 / 480 / 360"
+        required: true
+        default: "best"
 
 jobs:
   download:
@@ -21,119 +27,92 @@ jobs:
 
     steps:
 
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
-
           sudo apt update
-          sudo apt install -y ffmpeg aria2 zip parallel
+          sudo apt install -y ffmpeg zip
+          pip install -U yt-dlp
 
-          python3 -m pip install -U yt-dlp
-
-      - name: Prepare folders
+      - name: Create videos folder
         run: |
           mkdir -p videos
 
-      - name: Save URLs
+      - name: Download media
         run: |
 
-          cat > urls.txt << 'EOF'
-          ${{ github.event.inputs.urls }}
-          EOF
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
 
-      - name: Download videos
-        env:
-          THREADS: ${{ github.event.inputs.threads }}
-        run: |
+          if [ "$QUALITY" = "1080" ]; then
+            FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+          elif [ "$QUALITY" = "720" ]; then
+            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+          elif [ "$QUALITY" = "480" ]; then
+            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+          elif [ "$QUALITY" = "360" ]; then
+            FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]"
+          else
+            FORMAT="bv*+ba/b"
+          fi
 
-          sanitize() {
-            echo "$1" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-120
-          }
+          TITLE=$(yt-dlp --get-title --restrict-filenames "$URL")
 
-          split_large() {
+          mkdir -p "videos/$TITLE"
 
-            DIR="$1"
-
-            find "$DIR" -type f | while read f; do
-
-              SIZE=$(stat -c%s "$f")
-
-              if [ "$SIZE" -gt 95000000 ]; then
-
-                cd "$(dirname "$f")"
-
-                zip -s 95m -0 "$(basename "$f").zip" "$(basename "$f")"
-
-                rm -f "$(basename "$f")"
-
-                cd - >/dev/null
-
-              fi
-
-            done
-          }
-
-          download_one() {
-
-            URL="$1"
-
-            echo "Processing $URL"
-
-            TITLE=$(yt-dlp --get-title "$URL" | head -n1)
-
-            if [ -z "$TITLE" ]; then
-              TITLE="video_$(date +%s)"
-            fi
-
-            SAFE=$(sanitize "$TITLE")
-
-            DIR="videos/$SAFE"
-
-            mkdir -p "$DIR"
+          if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
 
             yt-dlp \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              --restrict-filenames \
+              --windows-filenames \
               --no-playlist \
-              --retries 30 \
-              --fragment-retries 30 \
-              --retry-sleep 5 \
-              --concurrent-fragments 5 \
-              --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -k 1M" \
-              --merge-output-format mp4 \
-              -o "$DIR/%(title)s.%(ext)s" \
+              -o "videos/$TITLE/%(title)s.%(ext)s" \
               "$URL"
 
-            COUNT=$(find "$DIR" -type f | wc -l)
+          else
 
-            if [ "$COUNT" -eq 0 ]; then
-              echo "Download failed for $URL"
-              exit 1
+            yt-dlp \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              --restrict-filenames \
+              --windows-filenames \
+              --no-playlist \
+              -o "videos/$TITLE/%(title)s.%(ext)s" \
+              "$URL"
+
+          fi
+
+      - name: Split large files
+        run: |
+
+          find videos -type f | while read f; do
+
+            size=$(stat -c%s "$f")
+
+            if [ $size -gt 95000000 ]; then
+
+              echo "Splitting $f"
+
+              zip -s 95m "${f}.zip" "$f"
+
+              rm "$f"
+
             fi
 
-            split_large "$DIR"
+          done
 
-          }
-
-          export -f sanitize
-          export -f split_large
-          export -f download_one
-
-          cat urls.txt | sed '/^\s*$/d' | parallel -j "$THREADS" download_one {}
-
-      - name: Remove empty folders
+      - name: Commit files to repo
         run: |
-          find videos -type d -empty -delete
-
-      - name: Commit
-        run: |
-
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
           git add videos/
 
-          git commit -m "Add downloaded videos" || echo "Nothing new"
+          git commit -m "Add downloaded media" || echo "Nothing to commit"
 
           git push
