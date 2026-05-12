@@ -1,4 +1,4 @@
-name: Ultimate Downloader
+name: Video Downloader
 
 on:
   workflow_dispatch:
@@ -7,26 +7,16 @@ on:
         description: "Video URLs (one per line)"
         required: true
 
-      mode:
-        description: "video or audio"
-        required: true
-        default: "video"
-
-      quality:
-        description: "best / 1080 / 720 / 480 / 360"
-        required: true
-        default: "best"
-
       threads:
         description: "Concurrent downloads"
         required: true
-        default: "8"
+        default: "6"
 
 permissions:
   contents: write
 
 jobs:
-  downloader:
+  download:
     runs-on: ubuntu-latest
 
     steps:
@@ -34,179 +24,109 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
+
           sudo apt update
+          sudo apt install -y ffmpeg aria2 zip parallel
 
-          sudo apt install -y \
-            ffmpeg \
-            zip \
-            unzip \
-            parallel \
-            aria2 \
-            jq
-
-          python3 -m pip install -U pip
           python3 -m pip install -U yt-dlp
 
       - name: Prepare folders
         run: |
           mkdir -p videos
-          mkdir -p temp
 
       - name: Save URLs
         run: |
+
           cat > urls.txt << 'EOF'
           ${{ github.event.inputs.urls }}
           EOF
 
       - name: Download videos
         env:
-          MODE: ${{ github.event.inputs.mode }}
-          QUALITY: ${{ github.event.inputs.quality }}
           THREADS: ${{ github.event.inputs.threads }}
         run: |
 
-          sanitize_title() {
-            echo "$1" \
-            | sed 's#[\\/:"*?<>|]#_#g' \
-            | tr -d '\r' \
-            | cut -c1-120
+          sanitize() {
+            echo "$1" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-120
           }
 
-          get_format() {
+          split_large() {
 
-            if [ "$QUALITY" = "best" ]; then
-              echo "bv*+ba/b"
-            else
-              echo "bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
-            fi
+            DIR="$1"
 
-          }
+            find "$DIR" -type f | while read f; do
 
-          split_large_files() {
-
-            TARGET_DIR="$1"
-
-            find "$TARGET_DIR" -type f | while read FILE; do
-
-              SIZE=$(stat -c%s "$FILE")
+              SIZE=$(stat -c%s "$f")
 
               if [ "$SIZE" -gt 95000000 ]; then
 
-                echo "Splitting: $FILE"
+                cd "$(dirname "$f")"
 
-                DIR=$(dirname "$FILE")
-                BASE=$(basename "$FILE")
+                zip -s 95m -0 "$(basename "$f").zip" "$(basename "$f")"
 
-                cd "$DIR"
-
-                zip -s 95m -0 "${BASE}.zip" "$BASE"
-
-                rm -f "$BASE"
+                rm -f "$(basename "$f")"
 
                 cd - >/dev/null
 
               fi
 
             done
-
           }
 
           download_one() {
 
             URL="$1"
 
-            echo "===================================="
-            echo "START: $URL"
-            echo "===================================="
+            echo "Processing $URL"
 
-            TITLE=$(yt-dlp \
-              --get-title \
-              --user-agent "Mozilla/5.0" \
-              "$URL" 2>/dev/null | head -n1)
+            TITLE=$(yt-dlp --get-title "$URL" | head -n1)
 
             if [ -z "$TITLE" ]; then
-              TITLE="video_$(date +%s)_$RANDOM"
+              TITLE="video_$(date +%s)"
             fi
 
-            SAFE_TITLE=$(sanitize_title "$TITLE")
+            SAFE=$(sanitize "$TITLE")
 
-            TARGET_DIR="videos/$SAFE_TITLE"
+            DIR="videos/$SAFE"
 
-            mkdir -p "$TARGET_DIR"
+            mkdir -p "$DIR"
 
-            if [ "$MODE" = "audio" ]; then
+            yt-dlp \
+              --no-playlist \
+              --retries 30 \
+              --fragment-retries 30 \
+              --retry-sleep 5 \
+              --concurrent-fragments 5 \
+              --downloader aria2c \
+              --downloader-args "aria2c:-x 16 -k 1M" \
+              --merge-output-format mp4 \
+              -o "$DIR/%(title)s.%(ext)s" \
+              "$URL"
 
-              yt-dlp \
-                --ignore-errors \
-                --no-playlist \
-                --continue \
-                --no-part \
-                --retries 30 \
-                --fragment-retries 30 \
-                --retry-sleep 5 \
-                --socket-timeout 30 \
-                --extractor-retries 10 \
-                --file-access-retries 10 \
-                --concurrent-fragments 5 \
-                --user-agent "Mozilla/5.0" \
-                --extract-audio \
-                --audio-format mp3 \
-                --audio-quality 0 \
-                --force-overwrites \
-                -o "$TARGET_DIR/%(title)s.%(ext)s" \
-                "$URL"
+            COUNT=$(find "$DIR" -type f | wc -l)
 
-            else
-
-              FORMAT=$(get_format)
-
-              yt-dlp \
-                --ignore-errors \
-                --no-playlist \
-                --continue \
-                --no-part \
-                --retries 30 \
-                --fragment-retries 30 \
-                --retry-sleep 5 \
-                --socket-timeout 30 \
-                --extractor-retries 10 \
-                --file-access-retries 10 \
-                --concurrent-fragments 5 \
-                --user-agent "Mozilla/5.0" \
-                --merge-output-format mp4 \
-                --force-overwrites \
-                -f "$FORMAT" \
-                -o "$TARGET_DIR/%(title)s.%(ext)s" \
-                "$URL"
-
+            if [ "$COUNT" -eq 0 ]; then
+              echo "Download failed for $URL"
+              exit 1
             fi
 
-            split_large_files "$TARGET_DIR"
-
-            echo "DONE: $URL"
+            split_large "$DIR"
 
           }
 
-          export -f sanitize_title
-          export -f get_format
-          export -f split_large_files
+          export -f sanitize
+          export -f split_large
           export -f download_one
 
-          cat urls.txt \
-            | grep -v '^$' \
-            | parallel -j "$THREADS" download_one {}
+          cat urls.txt | sed '/^\s*$/d' | parallel -j "$THREADS" download_one {}
 
-      - name: Cleanup empty folders
+      - name: Remove empty folders
         run: |
           find videos -type d -empty -delete
 
-      - name: Git status
-        run: |
-          git status
-
-      - name: Commit and push
+      - name: Commit
         run: |
 
           git config --global user.name "github-actions"
@@ -214,14 +134,6 @@ jobs:
 
           git add videos/
 
-          git commit -m "Add downloaded videos" || echo "Nothing to commit"
+          git commit -m "Add downloaded videos" || echo "Nothing new"
 
           git push
-
-      - name: Final report
-        run: |
-          echo "===================================="
-          echo "Download workflow completed"
-          echo "===================================="
-
-          find videos -type f
