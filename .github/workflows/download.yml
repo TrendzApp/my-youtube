@@ -1,64 +1,48 @@
-name: Pro Video Downloader
+name: Super Smart Downloader
 
 on:
   workflow_dispatch:
     inputs:
-
       urls:
-        description: "Video URLs (one per line)"
+        description: "URLs (one per line)"
         required: true
-
-      threads:
-        description: "Concurrent downloads"
+      parallel:
+        description: "Parallel URL workers"
+        default: "4"
         required: true
-        default: "6"
 
 permissions:
   contents: write
 
 jobs:
-  download:
-
+  downloader:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
-
-      - name: Checkout
+      - name: checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: install tools
         run: |
-
           sudo apt update
-
-          sudo apt install -y \
-            ffmpeg \
-            aria2 \
-            parallel \
-            zip \
-            unzip \
-            jq \
-            curl
-
-          python3 -m pip install -U pip
+          sudo apt install -y ffmpeg aria2 parallel jq curl grep sed zip
           python3 -m pip install -U yt-dlp
 
-      - name: Prepare folders
+      - name: prepare
         run: |
-
           mkdir -p videos
-          mkdir -p temp
+          mkdir -p logs
 
-      - name: Save URLs
-        run: |
-
-          cat > urls.txt << 'EOF'
+          cat <<EOF > urls.txt
           ${{ github.event.inputs.urls }}
           EOF
 
-      - name: Download videos
+          sed -i '/^\s*$/d' urls.txt
+
+      - name: smart engine
         env:
-          THREADS: ${{ github.event.inputs.threads }}
+          PARALLEL: ${{ github.event.inputs.parallel }}
         run: |
 
           sanitize() {
@@ -67,42 +51,62 @@ jobs:
 
           split_large() {
 
-            DIR="$1"
+            find "$1" -type f | while read f; do
 
-            find "$DIR" -type f | while read FILE; do
+              size=$(stat -c%s "$f")
 
-              SIZE=$(stat -c%s "$FILE")
+              if [ "$size" -gt 95000000 ]; then
 
-              if [ "$SIZE" -gt 95000000 ]; then
+                dir=$(dirname "$f")
+                base=$(basename "$f")
 
-                cd "$(dirname "$FILE")"
+                cd "$dir"
 
-                BASE=$(basename "$FILE")
+                zip -s 95m -0 "$base.zip" "$base"
 
-                zip -s 95m -0 "${BASE}.zip" "$BASE"
-
-                rm -f "$BASE"
+                rm -f "$base"
 
                 cd - >/dev/null
-
               fi
 
             done
-
           }
 
-          download_one() {
+          media_count() {
+
+            find "$1" -type f \( \
+            -iname "*.mp4" -o \
+            -iname "*.mkv" -o \
+            -iname "*.webm" -o \
+            -iname "*.mp3" -o \
+            -iname "*.m4a" \
+            \) | wc -l
+          }
+
+          crawl_page() {
 
             URL="$1"
 
-            echo "Processing:"
-            echo "$URL"
+            TMP="page.html"
+
+            curl -L -s "$URL" -o "$TMP"
+
+            grep -Eo '(https?://[^"]+\.(mp4|m3u8|webm|mpd))' "$TMP" | sort -u
+
+            grep -Eo 'src="https?://[^"]+"' "$TMP" \
+            | cut -d'"' -f2 \
+            | grep -E '(mp4|m3u8|webm|mpd)' \
+            | sort -u
+
+          }
+
+          download_single() {
+
+            URL="$1"
 
             TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1)
 
-            if [ -z "$TITLE" ]; then
-              TITLE="video_$(date +%s)"
-            fi
+            [ -z "$TITLE" ] && TITLE="video_$(date +%s)"
 
             SAFE=$(sanitize "$TITLE")
 
@@ -110,59 +114,138 @@ jobs:
 
             mkdir -p "$DIR"
 
+            BEFORE=$(media_count "$DIR")
+
             yt-dlp \
-              --no-playlist \
-              --retries 50 \
-              --fragment-retries 50 \
-              --retry-sleep 5 \
-              --socket-timeout 30 \
-              --extractor-retries 20 \
-              --file-access-retries 20 \
+              --continue \
+              --retries 40 \
+              --fragment-retries 40 \
               --concurrent-fragments 8 \
               --downloader aria2c \
               --downloader-args "aria2c:-x 16 -k 1M" \
               --merge-output-format mp4 \
-              --user-agent "Mozilla/5.0" \
               -o "$DIR/%(title)s.%(ext)s" \
-              "$URL"
+              "$URL" \
+              > "$DIR/log.txt" 2>&1 || true
 
-            COUNT=$(find "$DIR" -type f | wc -l)
+            AFTER=$(media_count "$DIR")
 
-            if [ "$COUNT" -eq 0 ]; then
-              echo "Download failed:"
-              echo "$URL"
-              exit 1
+            if [ "$AFTER" -le "$BEFORE" ]; then
+              return 1
             fi
 
             split_large "$DIR"
+          }
 
-            echo "Done:"
-            echo "$URL"
+          download_playlist() {
+
+            URL="$1"
+
+            NAME=$(yt-dlp --flat-playlist --print "%(playlist_title)s" "$URL" | head -n1)
+
+            [ -z "$NAME" ] && NAME="playlist_$(date +%s)"
+
+            SAFE=$(sanitize "$NAME")
+
+            DIR="videos/$SAFE"
+
+            mkdir -p "$DIR"
+
+            yt-dlp \
+              --yes-playlist \
+              --continue \
+              --retries 40 \
+              --fragment-retries 40 \
+              --concurrent-fragments 8 \
+              --downloader aria2c \
+              --downloader-args "aria2c:-x 16 -k 1M" \
+              -o "$DIR/%(playlist_index)s-%(title)s.%(ext)s" \
+              "$URL" \
+              > "$DIR/log.txt" 2>&1 || true
+
+            split_large "$DIR"
+          }
+
+          detect_type() {
+
+            URL="$1"
+
+            COUNT=$(yt-dlp --flat-playlist --dump-json "$URL" 2>/dev/null | wc -l)
+
+            if [ "$COUNT" -gt 1 ]; then
+              echo playlist
+            else
+              echo single
+            fi
+          }
+
+          process_url() {
+
+            URL="$1"
+
+            echo "Processing $URL"
+
+            TYPE=$(detect_type "$URL")
+
+            if [ "$TYPE" = "playlist" ]; then
+
+              echo "Playlist detected"
+
+              download_playlist "$URL"
+
+              return
+            fi
+
+            echo "Trying single video"
+
+            if download_single "$URL"; then
+              return
+            fi
+
+            echo "Trying crawl mode"
+
+            LINKS=$(crawl_page "$URL")
+
+            for L in $LINKS; do
+
+              echo "Found media $L"
+
+              download_single "$L" || true
+
+            done
 
           }
 
           export -f sanitize
           export -f split_large
-          export -f download_one
+          export -f media_count
+          export -f crawl_page
+          export -f download_single
+          export -f download_playlist
+          export -f detect_type
+          export -f process_url
 
-          cat urls.txt | sed '/^\s*$/d' | parallel -j "$THREADS" download_one {}
+          cat urls.txt | parallel -j $PARALLEL process_url {}
 
-      - name: Remove empty folders
+      - name: cleanup
         run: |
           find videos -type d -empty -delete
 
-      - name: Show files
+      - name: show files
         run: |
           find videos -type f
 
-      - name: Commit files
+      - name: commit
         run: |
 
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
-          git add videos/
+          git add videos
 
-          git commit -m "Add downloaded videos" || echo "Nothing new"
-
-          git push
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "auto downloaded media"
+            git push
+          fi
