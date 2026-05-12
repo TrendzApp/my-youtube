@@ -7,365 +7,66 @@ on:
         description: "URLs (one per line)"
         required: true
 
-      parallel:
-        description: "Parallel jobs"
-        required: true
-        default: "4"
-
 permissions:
   contents: write
 
 jobs:
   downloader:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install tools
         run: |
-          sudo apt update
-
-          sudo apt install -y \
-            ffmpeg \
-            aria2 \
-            parallel \
-            jq \
-            curl \
-            grep \
-            sed \
-            zip
-
+          sudo apt update && sudo apt install -y ffmpeg aria2 jq curl zip
           python3 -m pip install -U yt-dlp
 
       - name: Prepare
         run: |
-
-          mkdir -p videos
-          mkdir -p reports
-          mkdir -p temp
-
-          cat <<EOF > urls.txt
-          ${{ github.event.inputs.urls }}
-          EOF
-
+          mkdir -p videos reports
+          echo "${{ github.event.inputs.urls }}" > urls.txt
           sed -i '/^\s*$/d' urls.txt
 
-      - name: Smart Engine
-        env:
-          PARALLEL: ${{ github.event.inputs.parallel }}
+      - name: Run Downloader
         run: |
+          set -euo pipefail
 
-          set -Eeuo pipefail
-
-          sanitize() {
-            echo "$1" \
-            | sed 's#[\\/:"*?<>|]#_#g' \
-            | tr '\n' ' ' \
-            | cut -c1-120
-          }
-
-          media_count() {
-
-            find "$1" -type f \( \
-              -iname "*.mp4" -o \
-              -iname "*.mkv" -o \
-              -iname "*.webm" -o \
-              -iname "*.mp3" -o \
-              -iname "*.m4a" -o \
-              -iname "*.mov" \
-            \) | wc -l
-          }
-
-          split_large() {
-
-            find "$1" -type f | while read -r f; do
-
-              size=$(stat -c%s "$f")
-
-              if [ "$size" -gt 95000000 ]; then
-
-                dir=$(dirname "$f")
-                base=$(basename "$f")
-
-                echo "Splitting large file: $base"
-
-                cd "$dir"
-
-                zip -s 95m -0 "$base.zip" "$base"
-
-                rm -f "$base"
-
-                cd - >/dev/null
-              fi
-
-            done
-          }
-
-          crawl_page() {
-
-            URL="$1"
-
-            TMP="temp/page_$(date +%s%N).html"
-
-            curl \
-              -L \
-              --silent \
-              --fail \
-              "$URL" \
-              -o "$TMP" || true
-
-            grep -Eo '(https?://[^"'"'"' ]+\.(mp4|m3u8|webm|mpd))' "$TMP" 2>/dev/null || true
-
-            grep -Eo 'src="https?://[^"]+"' "$TMP" \
-            | cut -d'"' -f2 \
-            | grep -E '(mp4|m3u8|webm|mpd)' || true
-
-            grep -Eo 'https://[^ ]+' "$TMP" \
-            | grep -E '(video|stream|m3u8|mp4)' || true
-
-            rm -f "$TMP"
-
-          }
-
-          detect_type() {
-
-            URL="$1"
-
-            if yt-dlp --flat-playlist --dump-json "$URL" > temp/check.json 2>/dev/null; then
-
-              COUNT=$(cat temp/check.json | wc -l)
-
-              if [ "$COUNT" -gt 1 ]; then
-                echo "playlist"
-                return
-              fi
-
-            fi
-
-            echo "single"
-
-          }
-
-          already_downloaded() {
-
-            URL="$1"
-
-            if grep -R "$URL" reports 2>/dev/null; then
-              return 0
-            fi
-
-            return 1
-          }
-
-          save_report() {
-
-            URL="$1"
-            STATUS="$2"
-            DIR="$3"
-
-            FILE="reports/report_$(date +%s%N).json"
-
-            cat <<EOF > "$FILE"
-          {
-            "url": "$URL",
-            "status": "$STATUS",
-            "directory": "$DIR",
-            "timestamp": "$(date)"
-          }
-          EOF
-          }
-
+          # تابع دانلود تک ویدیو
           download_single() {
-
-            URL="$1"
-
-            TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || true)
-
-            [ -z "$TITLE" ] && TITLE="video_$(date +%s)"
-
-            SAFE=$(sanitize "$TITLE")
-
-            DIR="videos/$SAFE"
-
+            local URL="$1"
+            local TITLE=$(yt-dlp --get-title "$URL" 2>/dev/null | head -n1 || echo "video_$(date +%s)")
+            local SAFE=$(echo "$TITLE" | sed 's#[\\/:"*?<>|]#_#g' | cut -c1-100)
+            local DIR="videos/$SAFE"
             mkdir -p "$DIR"
 
-            BEFORE=$(media_count "$DIR")
-
+            echo "Downloading: $URL"
             yt-dlp \
-              --continue \
-              --no-overwrites \
-              --retries 50 \
-              --fragment-retries 50 \
-              --retry-sleep 5 \
-              --concurrent-fragments 8 \
-              --extractor-retries 20 \
-              --file-access-retries 20 \
-              --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              --merge-output-format mp4 \
-              --embed-metadata \
-              --embed-thumbnail \
-              --write-info-json \
-              --write-description \
-              -o "$DIR/%(title)s.%(ext)s" \
-              "$URL" \
-              > "$DIR/download.log" 2>&1 || true
-
-            AFTER=$(media_count "$DIR")
-
-            if [ "$AFTER" -le "$BEFORE" ]; then
-
-              echo "No media downloaded from $URL"
-
-              save_report "$URL" "failed" "$DIR"
-
-              return 1
-            fi
-
-            split_large "$DIR"
-
-            save_report "$URL" "success" "$DIR"
-
-            return 0
+              --continue --retries 30 --fragment-retries 30 \
+              --downloader aria2c --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+              --embed-metadata --write-info-json \
+              -o "$DIR/%(title)s.%(ext)s" "$URL" > "$DIR/log.txt" 2>&1 || return 1
+            
+            # تقسیم فایل‌های بزرگ
+            find "$DIR" -type f -size +95M -exec zip -s 95m -0 "{}.zip" "{}" \; -exec rm "{}" \;
           }
 
-          download_playlist() {
-
-            URL="$1"
-
-            NAME=$(yt-dlp \
-              --flat-playlist \
-              --print "%(playlist_title)s" \
-              "$URL" 2>/dev/null \
-              | head -n1 || true)
-
-            [ -z "$NAME" ] && NAME="playlist_$(date +%s)"
-
-            SAFE=$(sanitize "$NAME")
-
-            DIR="videos/$SAFE"
-
-            mkdir -p "$DIR"
-
-            yt-dlp \
-              --yes-playlist \
-              --continue \
-              --no-overwrites \
-              --retries 50 \
-              --fragment-retries 50 \
-              --concurrent-fragments 8 \
-              --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              --embed-metadata \
-              --write-info-json \
-              -o "$DIR/%(playlist_index)s-%(title)s.%(ext)s" \
-              "$URL" \
-              > "$DIR/download.log" 2>&1 || true
-
-            COUNT=$(media_count "$DIR")
-
-            if [ "$COUNT" -eq 0 ]; then
-
-              echo "Playlist failed"
-
-              save_report "$URL" "failed" "$DIR"
-
-              return 1
-            fi
-
-            split_large "$DIR"
-
-            save_report "$URL" "success" "$DIR"
-
-            return 0
-          }
-
-          process_url() {
-
-            URL="$1"
-
-            echo ""
-            echo "====================================="
-            echo "Processing: $URL"
-            echo "====================================="
-
-            if already_downloaded "$URL"; then
-              echo "Already downloaded before"
-              return
-            fi
-
-            TYPE=$(detect_type "$URL")
-
-            echo "Detected type: $TYPE"
-
-            if [ "$TYPE" = "playlist" ]; then
-
-              download_playlist "$URL" && return
-
-            fi
-
-            if download_single "$URL"; then
-              return
-            fi
-
-            echo "Trying crawl mode..."
-
-            LINKS=$(crawl_page "$URL" | sort -u)
-
-            for L in $LINKS; do
-
-              echo "Found media: $L"
-
-              download_single "$L" || true
-
-            done
-
-          }
-
-          export -f sanitize
-          export -f media_count
-          export -f split_large
-          export -f crawl_page
-          export -f detect_type
-          export -f already_downloaded
-          export -f save_report
-          export -f download_single
-          export -f download_playlist
-          export -f process_url
-
-          parallel \
-            -j "$PARALLEL" \
-            process_url \
-            :::: urls.txt
-
-      - name: Cleanup empty folders
-        run: |
-          find videos -type d -empty -delete
-
-      - name: Show downloaded files
-        run: |
-          echo "Downloaded files:"
-          find videos -type f || true
+          # حلقه اصلی (جایگزین parallel برای جلوگیری از ارور)
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            download_single "$url" || echo "Failed to download $url" >> reports/errors.txt
+          done < urls.txt
 
       - name: Commit and Push
         run: |
-
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
-
           git add videos reports
-
-          if git diff --cached --quiet; then
-
-            echo "Nothing to commit"
-
-          else
-
-            git commit -m "auto downloaded media"
+          if ! git diff --cached --quiet; then
+            git commit -m "auto download finished"
             git push
-
+          else
+            echo "Nothing new to commit."
           fi
