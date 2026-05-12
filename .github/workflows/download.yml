@@ -1,14 +1,10 @@
-name: Universal Downloader
-
-permissions:
-  contents: write
+name: Ultimate Downloader
 
 on:
   workflow_dispatch:
     inputs:
-
-      url:
-        description: "Video URL"
+      urls:
+        description: "Video URLs (one per line)"
         required: true
 
       mode:
@@ -21,98 +17,211 @@ on:
         required: true
         default: "best"
 
+      threads:
+        description: "Concurrent downloads"
+        required: true
+        default: "8"
+
+permissions:
+  contents: write
+
 jobs:
-  download:
+  downloader:
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg zip
-          pip install -U yt-dlp
 
-      - name: Create videos folder
+          sudo apt install -y \
+            ffmpeg \
+            zip \
+            unzip \
+            parallel \
+            aria2 \
+            jq
+
+          python3 -m pip install -U pip
+          python3 -m pip install -U yt-dlp
+
+      - name: Prepare folders
         run: |
           mkdir -p videos
+          mkdir -p temp
 
-      - name: Download media
+      - name: Save URLs
+        run: |
+          cat > urls.txt << 'EOF'
+          ${{ github.event.inputs.urls }}
+          EOF
+
+      - name: Download videos
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          QUALITY: ${{ github.event.inputs.quality }}
+          THREADS: ${{ github.event.inputs.threads }}
         run: |
 
-          URL="${{ github.event.inputs.url }}"
-          QUALITY="${{ github.event.inputs.quality }}"
+          sanitize_title() {
+            echo "$1" \
+            | sed 's#[\\/:"*?<>|]#_#g' \
+            | tr -d '\r' \
+            | cut -c1-120
+          }
 
-          if [ "$QUALITY" = "1080" ]; then
-            FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-          elif [ "$QUALITY" = "720" ]; then
-            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
-          elif [ "$QUALITY" = "480" ]; then
-            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
-          elif [ "$QUALITY" = "360" ]; then
-            FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]"
-          else
-            FORMAT="bv*+ba/b"
-          fi
+          get_format() {
 
-          TITLE=$(yt-dlp --get-title --restrict-filenames "$URL")
+            if [ "$QUALITY" = "best" ]; then
+              echo "bv*+ba/b"
+            else
+              echo "bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
+            fi
 
-          mkdir -p "videos/$TITLE"
+          }
 
-          if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
+          split_large_files() {
 
-            yt-dlp \
-              --extract-audio \
-              --audio-format mp3 \
-              --audio-quality 0 \
-              --restrict-filenames \
-              --windows-filenames \
-              --no-playlist \
-              -o "videos/$TITLE/%(title)s.%(ext)s" \
-              "$URL"
+            TARGET_DIR="$1"
 
-          else
+            find "$TARGET_DIR" -type f | while read FILE; do
 
-            yt-dlp \
-              -f "$FORMAT" \
-              --merge-output-format mp4 \
-              --restrict-filenames \
-              --windows-filenames \
-              --no-playlist \
-              -o "videos/$TITLE/%(title)s.%(ext)s" \
-              "$URL"
+              SIZE=$(stat -c%s "$FILE")
 
-          fi
+              if [ "$SIZE" -gt 95000000 ]; then
 
-      - name: Split large files
-        run: |
+                echo "Splitting: $FILE"
 
-          find videos -type f | while read f; do
+                DIR=$(dirname "$FILE")
+                BASE=$(basename "$FILE")
 
-            size=$(stat -c%s "$f")
+                cd "$DIR"
 
-            if [ $size -gt 95000000 ]; then
+                zip -s 95m -0 "${BASE}.zip" "$BASE"
 
-              echo "Splitting $f"
+                rm -f "$BASE"
 
-              zip -s 95m "${f}.zip" "$f"
+                cd - >/dev/null
 
-              rm "$f"
+              fi
+
+            done
+
+          }
+
+          download_one() {
+
+            URL="$1"
+
+            echo "===================================="
+            echo "START: $URL"
+            echo "===================================="
+
+            TITLE=$(yt-dlp \
+              --get-title \
+              --user-agent "Mozilla/5.0" \
+              "$URL" 2>/dev/null | head -n1)
+
+            if [ -z "$TITLE" ]; then
+              TITLE="video_$(date +%s)_$RANDOM"
+            fi
+
+            SAFE_TITLE=$(sanitize_title "$TITLE")
+
+            TARGET_DIR="videos/$SAFE_TITLE"
+
+            mkdir -p "$TARGET_DIR"
+
+            if [ "$MODE" = "audio" ]; then
+
+              yt-dlp \
+                --ignore-errors \
+                --no-playlist \
+                --continue \
+                --no-part \
+                --retries 30 \
+                --fragment-retries 30 \
+                --retry-sleep 5 \
+                --socket-timeout 30 \
+                --extractor-retries 10 \
+                --file-access-retries 10 \
+                --concurrent-fragments 5 \
+                --user-agent "Mozilla/5.0" \
+                --extract-audio \
+                --audio-format mp3 \
+                --audio-quality 0 \
+                --force-overwrites \
+                -o "$TARGET_DIR/%(title)s.%(ext)s" \
+                "$URL"
+
+            else
+
+              FORMAT=$(get_format)
+
+              yt-dlp \
+                --ignore-errors \
+                --no-playlist \
+                --continue \
+                --no-part \
+                --retries 30 \
+                --fragment-retries 30 \
+                --retry-sleep 5 \
+                --socket-timeout 30 \
+                --extractor-retries 10 \
+                --file-access-retries 10 \
+                --concurrent-fragments 5 \
+                --user-agent "Mozilla/5.0" \
+                --merge-output-format mp4 \
+                --force-overwrites \
+                -f "$FORMAT" \
+                -o "$TARGET_DIR/%(title)s.%(ext)s" \
+                "$URL"
 
             fi
 
-          done
+            split_large_files "$TARGET_DIR"
 
-      - name: Commit files to repo
+            echo "DONE: $URL"
+
+          }
+
+          export -f sanitize_title
+          export -f get_format
+          export -f split_large_files
+          export -f download_one
+
+          cat urls.txt \
+            | grep -v '^$' \
+            | parallel -j "$THREADS" download_one {}
+
+      - name: Cleanup empty folders
         run: |
+          find videos -type d -empty -delete
+
+      - name: Git status
+        run: |
+          git status
+
+      - name: Commit and push
+        run: |
+
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
           git add videos/
 
-          git commit -m "Add downloaded media" || echo "Nothing to commit"
+          git commit -m "Add downloaded videos" || echo "Nothing to commit"
 
           git push
+
+      - name: Final report
+        run: |
+          echo "===================================="
+          echo "Download workflow completed"
+          echo "===================================="
+
+          find videos -type f
