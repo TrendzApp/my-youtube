@@ -1,16 +1,22 @@
-name: Video Downloader Pro
+name: Universal Downloader
 
 on:
   workflow_dispatch:
     inputs:
+
       url:
         description: "Video URL"
         required: true
 
-      format:
-        description: "video or mp3"
+      mode:
+        description: "video or audio"
         required: true
         default: video
+
+      quality:
+        description: "best / 1080 / 720 / 480 / 360"
+        required: true
+        default: best
 
 jobs:
   download:
@@ -21,51 +27,97 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install packages
         run: |
           sudo apt update
-          sudo apt install ffmpeg zip nodejs npm -y
+          sudo apt install -y ffmpeg zip
           pip install -U yt-dlp
-
-      - name: Create cookies file
-        run: |
-          echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
 
       - name: Download
         run: |
+
           mkdir -p videos
 
-          if [ "${{ github.event.inputs.format }}" = "mp3" ]; then
-            yt-dlp \
-              --cookies cookies.txt \
-              --extract-audio \
-              --audio-format mp3 \
-              -o "videos/%(title)s.%(ext)s" \
-              "${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+
+          if [ "$QUALITY" = "1080" ]; then
+            FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+          elif [ "$QUALITY" = "720" ]; then
+            FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+          elif [ "$QUALITY" = "480" ]; then
+            FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+          elif [ "$QUALITY" = "360" ]; then
+            FORMAT="bestvideo[height<=360]+bestaudio/best[height<=360]"
           else
-            yt-dlp \
-              --cookies cookies.txt \
-              -o "videos/%(title)s.%(ext)s" \
-              "${{ github.event.inputs.url }}"
+            FORMAT="bv*+ba/b"
           fi
 
-      - name: Split files
+          if [ "${{ github.event.inputs.mode }}" = "audio" ]; then
+
+            yt-dlp \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              --embed-metadata \
+              --embed-thumbnail \
+              --add-metadata \
+              --retries 10 \
+              --fragment-retries 10 \
+              --concurrent-fragments 4 \
+              --user-agent "Mozilla/5.0" \
+              -o "videos/%(title)s.%(ext)s" \
+              "${{ github.event.inputs.url }}"
+
+          else
+
+            yt-dlp \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              --embed-metadata \
+              --embed-thumbnail \
+              --add-metadata \
+              --retries 10 \
+              --fragment-retries 10 \
+              --concurrent-fragments 4 \
+              --user-agent "Mozilla/5.0" \
+              -o "videos/%(title)s.%(ext)s" \
+              "${{ github.event.inputs.url }}"
+
+          fi
+
+      - name: Split large files
         run: |
+
           cd videos
 
           for f in *; do
-            size=$(stat -c%s "$f")
 
-            if [ $size -gt 95000000 ]; then
-              zip -s 95m "$f.zip" "$f"
-              rm "$f"
+            if [ -f "$f" ]; then
+
+              size=$(stat -c%s "$f")
+
+              if [ $size -gt 95000000 ]; then
+
+                zip -s 95m "$f.zip" "$f"
+
+                rm "$f"
+
+              fi
+
             fi
+
           done
 
-      - name: Upload Release
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-files
+          path: videos/*
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: videos-${{ github.run_number }}
+          tag_name: release-${{ github.run_number }}
           files: videos/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
