@@ -1,5 +1,8 @@
 name: Universal Downloader
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -110,9 +113,9 @@ jobs:
 
               if [ $size -gt 95000000 ]; then
 
-                echo "Splitting $f"
+                echo "Splitting $f into multi-part zip"
 
-                zip -s 95m "$f.zip" "$f"
+                zip -s 95m "${f}.zip" "$f"
 
                 rm "$f"
 
@@ -134,6 +137,7 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        continue-on-error: true
         with:
           tag_name: release-${{ github.run_number }}
           name: release-${{ github.run_number }}
